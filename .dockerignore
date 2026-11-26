@@ -1,0 +1,16 @@
+.git
+.venv
+venv
+__pycache__
+.pytest_cache
+.github
+tests
+data
+*.db
+*.sqlite
+*.sqlite3
+*.env
+.streamlit/secrets.toml
+*.py[cod]
+.coverage
+htmlcov
