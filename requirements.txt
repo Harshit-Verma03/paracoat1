@@ -4,5 +4,5 @@ openpyxl>=3.1,<4
 ortools>=9.8,<10
 requests>=2.31,<3
 folium>=0.16,<1
-streamlit-folium>=0.20,<1
+streamlit-folium>=0.27.4,<1
 plotly>=5.18,<7
