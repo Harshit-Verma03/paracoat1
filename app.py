@@ -11,7 +11,7 @@ from paracoat.validation import validate_inputs
 from paracoat.routing import build_matrix
 from paracoat.routing import build_route_geometry
 from paracoat.packing import check_fit, orientation_options
-from paracoat.dispatch import build_dispatch, reassign_order, change_parcel_orientation, move_stop
+from paracoat.dispatch import build_dispatch, reassign_order, change_parcel_orientation, move_parcel_position, move_stop
 from paracoat.workbooks import workbook_template, extended_demo_workbook, export_plan, load_planning_workbook
 from paracoat.sample_data import extended_demo_orders, extended_demo_parcels, extended_demo_fleet, sample_depot
 from paracoat.repository import initialize as initialize_catalog, seed_extended_demo_catalog, get_depot, get_fleet, get_settings, get_shipment_lines, list_shipments, approve_plan, get_plan_history, get_plan_detail
@@ -255,7 +255,7 @@ with right:
     try:departure_default=datetime.strptime(planning_defaults.get("default_departure","08:00"),"%H:%M").time()
     except ValueError:departure_default=dt_time(8,0)
     departure_time=st.time_input("Route departure time",value=departure_default,help="Used for delivery-window checks.").strftime("%H:%M")
-    time_limit=st.slider("Optimizer search time",2,30,8,help="Longer searches may improve the plan but take longer.")
+    time_limit=st.slider("Optimizer search time",2,30,20,help="The time limit covers assignment, delivery-order packing, and route checks. Larger scenarios may return a partial plan when the search ends.")
     st.caption("Capacity is checked in kilograms. Parcel dimensions use centimetres. Window times use local 24-hour HH:MM.")
 
 if orders is None or parcels is None or fleet is None or depot is None:
@@ -367,13 +367,38 @@ with map_tab:
                 st.caption("Road geometry was unavailable for: "+", ".join(geometry_fallback)+". Their map connectors are schematic straight lines.")
         except ImportError: st.warning("Install folium and streamlit-folium to enable the interactive route map.")
 with load_tab:
+    if plan.get("load_optimizer_status"):
+        st.caption("Fleet loading: {} · {} assignment candidate(s) checked · {} vehicle(s) used · {:.1f}s · CP-SAT {}{}".format(
+            plan["load_optimizer_status"],plan.get("load_candidates_checked",0),plan.get("vehicles_used",0),
+            float(plan.get("load_elapsed_seconds") or 0),plan.get("load_solver_status") or "N/A",
+            " · CP-SAT found an optimal assignment under this model" if plan.get("vehicle_count_optimal") else " · best result within search limit"))
+        st.caption("Cargo placement is validated by a deterministic geometric heuristic; its result is not a proof of globally optimal 3D packing.")
+        st.caption("Repair pass: {} additional shipment(s) placed after {} incremental vehicle-load checks.".format(
+            plan.get("load_repair_shipments_added",0),plan.get("load_repair_attempts",0)))
+        diagnostics=plan.get("load_candidate_diagnostics",[])
+        if diagnostics:
+            with st.expander("Optimizer candidate diagnostics",expanded=False):
+                summary=pd.DataFrame([{ "Candidate":row.get("candidate"),
+                    "Shipments proposed":row.get("assigned_shipments"),
+                    "Shipments packed":row.get("packed_shipments"),
+                    "Vehicles proposed":row.get("vehicles_proposed"),
+                    "Vehicles with validation failures":len(row.get("failed_groups",[])) }
+                    for row in diagnostics])
+                st.dataframe(summary,width="stretch",hide_index=True)
+                group_rows=[{"Candidate":row.get("candidate"),
+                    "Vehicle_ID":group.get("Vehicle_ID"),
+                    "Order_IDs":", ".join(map(str,group.get("Order_IDs",[]))),
+                    "Candidate validation issue":group.get("Reason","")}
+                    for row in diagnostics for group in row.get("failed_groups",[])]
+                if group_rows:
+                    st.caption("A listed issue describes that candidate only. It does not prove that a shipment cannot fit any vehicle.")
+                    st.dataframe(pd.DataFrame(group_rows),width="stretch",hide_index=True)
+                repair_rows=plan.get("load_repair_rejections",[])
+                if repair_rows:
+                    st.markdown("**Repair attempts that did not fit**")
+                    st.dataframe(pd.DataFrame(repair_rows),width="stretch",hide_index=True)
     if not plan.get("fit_results"): st.info("No parcel-fit results are available yet.")
     else:
-        if plan.get("load_optimizer_status"):
-            st.caption("Fleet loading: {} · {} assignment candidate(s) checked · {} vehicle(s) used{}".format(
-                plan["load_optimizer_status"],plan.get("load_candidates_checked",0),plan.get("vehicles_used",0),
-                " · CP-SAT found an optimal assignment under this model" if plan.get("vehicle_count_optimal") else " · best result within search limit"))
-            st.caption("Cargo placement is validated by a deterministic geometric heuristic; its result is not a proof of globally optimal 3D packing.")
         for vid,result in plan["fit_results"].items():
             vehicle=fleet[fleet.Vehicle_ID.astype(str)==str(vid)].iloc[0]
             vehicle_routes=routes[routes.Vehicle_ID.astype(str)==str(vid)] if not routes.empty else pd.DataFrame()
@@ -384,10 +409,13 @@ with load_tab:
                 st.caption("Payload {:.1f} / {:.1f} kg · cargo volume {:.1f}% used. Geometric placement estimates do not prove a safe loading sequence.".format(
                     loaded_kg,float(vehicle.Capacity_kg),float(result.get("volume_used_pct",0))))
                 placements=pd.DataFrame([row for row in plan.get("placements",[]) if str(row.get("Vehicle_ID"))==str(vid)])
+                if not placements.empty and "Load_Sequence" in placements:
+                    placements=placements.sort_values("Load_Sequence")
                 if placements.empty:st.info("No parcel placements were produced for this vehicle.")
                 else:
-                    columns=["Vehicle_ID","Parcel_Unit_ID","Order_ID","Parcel_ID","Orientation","X_cm","Y_cm","Z_cm","Placed_Length_cm","Placed_Width_cm","Placed_Height_cm","Weight_kg"]
+                    columns=["Load_Sequence","Delivery_Stop","Vehicle_ID","Parcel_Unit_ID","Order_ID","Parcel_ID","Orientation","X_cm","Y_cm","Z_cm","Placed_Length_cm","Placed_Width_cm","Placed_Height_cm","Weight_kg"]
                     st.dataframe(placements[[c for c in columns if c in placements.columns]],width="stretch",hide_index=True)
+                    st.caption("Loading plan: pack in reverse route order. Stop 1 is nearest the rear door (right end of the diagram); later stops are placed deeper toward the cab.")
                     view_3d,view_2d=st.tabs(["3D cargo preview","2D cargo layer"])
                     with view_3d:render_loading_3d(placements.to_dict("records"),vehicle,str(vid))
                     with view_2d:render_loading_layer(placements.to_dict("records"),vehicle,str(vid))
@@ -437,6 +465,27 @@ with edit_tab:
                     st.session_state.edits+=1; updated["manual_edits"]=st.session_state.edits; st.session_state.plan=updated
                     save_plan(st.session_state.plan_id,plan_date,updated,st.session_state.inputs,"Edited draft")
                     st.success("Orientation applied; the vehicle load was repacked and revalidated."); st.rerun()
+            st.markdown("#### Adjust a parcel unit position")
+            st.caption("Set X/Y/Z in centimetres. The selected unit stays at these coordinates while other units in that vehicle may be repacked; the full load is checked before changes are saved.")
+            position_unit=st.selectbox("Parcel unit to move",list(unit_options),format_func=lambda value:
+                "{} · {} · {}".format(value,unit_options[value].get("Parcel_ID"),unit_options[value].get("Vehicle_ID")),
+                key="position_unit",disabled=bool(plan.get("approver")))
+            position=unit_options[position_unit]
+            position_cols=st.columns(3)
+            target_x=position_cols[0].number_input("X position (cm)",min_value=0.0,value=float(position["X_cm"]),step=1.0,format="%.1f",key="position_x_"+position_unit,disabled=bool(plan.get("approver")))
+            target_y=position_cols[1].number_input("Y position (cm)",min_value=0.0,value=float(position["Y_cm"]),step=1.0,format="%.1f",key="position_y_"+position_unit,disabled=bool(plan.get("approver")))
+            target_z=position_cols[2].number_input("Z position (cm)",min_value=0.0,value=float(position["Z_cm"]),step=1.0,format="%.1f",key="position_z_"+position_unit,disabled=bool(plan.get("approver")))
+            position_unchanged=all(abs(float(target)-float(position[key]))<1e-6
+                                   for target,key in ((target_x,"X_cm"),(target_y,"Y_cm"),(target_z,"Z_cm")))
+            if st.button("Apply parcel position",disabled=position_unchanged or bool(plan.get("approver"))):
+                try:
+                    updated=move_parcel_position(plan,position_unit,target_x,target_y,target_z,parcels,fleet)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state.edits+=1; updated["manual_edits"]=st.session_state.edits; st.session_state.plan=updated
+                    save_plan(st.session_state.plan_id,plan_date,updated,st.session_state.inputs,"Edited draft")
+                    st.success("Parcel position applied; the complete vehicle load was revalidated."); st.rerun()
         if not routes.empty:
             st.markdown("#### Adjust delivery sequence")
             stop_order=routes.Order_ID.astype(str).tolist()
@@ -446,12 +495,12 @@ with edit_tab:
                 with column:
                     if st.button(label,key="move_"+direction,disabled=bool(plan.get("approver"))):
                         try:
-                            updated=move_stop(plan,stop_id,direction,orders,plan["distances"],plan["durations"],plan.get("departure_time","08:00"))
+                            updated=move_stop(plan,stop_id,direction,orders,plan["distances"],plan["durations"],plan.get("departure_time","08:00"),parcels,fleet)
                         except ValueError as exc: st.error(str(exc))
                         else:
                             st.session_state.edits+=1; updated["manual_edits"]=st.session_state.edits; st.session_state.plan=updated
                             save_plan(st.session_state.plan_id,plan_date,updated,st.session_state.inputs,"Edited draft")
-                            st.success("Stop order updated and route estimates recalculated."); st.rerun()
+                            st.success("Stop order updated; cargo was repacked and delivery access revalidated."); st.rerun()
     st.caption("Stop-order edits that would violate a configured delivery window are rejected.")
 with export_tab:
     st.markdown("### Final dispatcher review")
@@ -462,9 +511,11 @@ with export_tab:
     for vid in current_loads:
         ids=routes.loc[routes.Vehicle_ID.astype(str)==str(vid),"Order_ID"].astype(str).tolist()
         current_fit[str(vid)]=check_fit(parcels[parcels.Order_ID.astype(str).isin(ids)],fleet.loc[fleet.Vehicle_ID.astype(str)==str(vid)].iloc[0])
-    outstanding=not unassigned.empty or bool(overweight) or any(not r["fits"] for r in current_fit.values())
+    outstanding=(not plan.get("complete",False) or not unassigned.empty or bool(overweight)
+                 or any(not r["fits"] for r in current_fit.values()))
     if overweight: st.error("Payload capacity exceeded for: "+", ".join(map(str,overweight)))
-    if outstanding: st.warning("Resolve unassigned orders and parcel-fit review items before approval.")
+    if outstanding:
+        st.warning("This is an incomplete planning result. Assign every selected shipment and resolve all fit or capacity issues before approval or dispatch export.")
     approver=st.text_input("Dispatcher name for approval record",placeholder="Name")
     approved=st.checkbox("I reviewed the assignments and understand the estimates and load-safety limitations.",disabled=outstanding or not approver.strip())
     if plan.get("approver"):
@@ -481,5 +532,6 @@ with export_tab:
             st.session_state.plan=plan
             st.success("Plan approved. Selected shipment quantities were allocated and remaining units stay available.")
     book=export_plan(plan,parcels,fleet,st.session_state.plan_id,plan_date,st.session_state.edits,plan.get("approver", ""))
-    st.download_button("Download dispatch workbook",data=book,file_name=f"paracoat_dispatch_{plan_date.isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch")
-    st.caption("Workbook includes summary, vehicle capacities, route stops, exceptions, parcel inputs, approval status and limitations.")
+    st.download_button("Download dispatch workbook",data=book,file_name=f"paracoat_dispatch_{plan_date.isoformat()}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch",disabled=outstanding)
+    if outstanding:st.caption("Dispatch export is enabled only after every selected shipment has a matching route and a complete validated parcel manifest.")
+    else:st.caption("Workbook includes summary, vehicle capacities, route stops, parcel inputs, approval status and limitations.")

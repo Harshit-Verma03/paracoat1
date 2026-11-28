@@ -1,5 +1,5 @@
 """Vehicle routing and capacity planning using OR-Tools when installed."""
-from collections import defaultdict
+import math
 
 
 def _fallback_plan(orders, fleet, distances, durations, depot_index=0, objective="Distance"):
@@ -19,7 +19,8 @@ def _fallback_plan(orders, fleet, distances, durations, depot_index=0, objective
         for v in candidates:
             prev=routes[v][-1]["_matrix_index"] if routes[v] else depot_index
             # Include the return leg so the heuristic prefers consolidating nearby stops.
-            cost=distances[prev][oi]+distances[oi][depot_index]-distances[prev][depot_index]
+            metric=durations if str(objective).lower().startswith("travel") else distances
+            cost=metric[prev][oi]+metric[oi][depot_index]-metric[prev][depot_index]
             if best is None or cost<best[0]: best=(cost,v)
         v=best[1]; routes[v].append(order.to_dict()); remaining[v]-=demand
     return _format(routes,available,remaining,distances,durations,unassigned,objective)
@@ -64,10 +65,12 @@ def optimize(orders, fleet, distances, durations, objective="Distance", depot_in
         return int((durations[origin][destination]+service)*60)
     time_cb_index=routing.RegisterTransitCallback(time_cb)
     routing.SetArcCostEvaluatorOfAllVehicles(dist_cb if objective=="Distance" else time_cb_index)
-    demands=[0]+[int(round(float(v))) for v in orders.Demand_kg]
+    # Preserve fractional kilogram precision so route feasibility agrees with
+    # the fleet-loading optimizer, which checks payload in grams.
+    demands=[0]+[int(math.ceil(float(v)*1000-1e-9)) for v in orders.Demand_kg]
     def demand_cb(index): return demands[manager.IndexToNode(index)]
     demand_idx=routing.RegisterUnaryTransitCallback(demand_cb)
-    capacities=[int(round(float(v))) for v in available.Capacity_kg]
+    capacities=[int(math.floor(float(v)*1000+1e-9)) for v in available.Capacity_kg]
     routing.AddDimensionWithVehicleCapacity(demand_idx,0,capacities,True,"Capacity")
     try:
         departure_hours,departure_minutes=map(int,str(departure_time).split(":")[:2])
@@ -87,7 +90,8 @@ def optimize(orders, fleet, distances, durations, objective="Distance", depot_in
                 time_dim.CumulVar(idx).SetRange(mins(start),mins(end))
             except Exception: pass
         routing.AddDisjunction([idx],10**8)
-    params=pywrapcp.DefaultRoutingSearchParameters(); params.first_solution_strategy=routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC; params.local_search_metaheuristic=routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH; params.time_limit.FromSeconds(int(time_limit_seconds))
+    params=pywrapcp.DefaultRoutingSearchParameters(); params.first_solution_strategy=routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC; params.local_search_metaheuristic=routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.time_limit.FromMilliseconds(max(1,int(float(time_limit_seconds)*1000)))
     solution=routing.SolveWithParameters(params)
     if solution is None:
         return {"routes":[],"unassigned":[{"Order_ID":str(row.Order_ID),"Reason":"No feasible route found under the configured constraints."} for _,row in orders.iterrows()],"total_km":0,"total_minutes":0,"vehicles_used":0,"status":"No feasible plan","method":"Google OR-Tools (time-limited search)","objective":objective}

@@ -40,10 +40,12 @@ def render_loading_layer(placements,vehicle,key):
         color=_color(item.get("Order_ID",item.get("Parcel_ID","")))
         label=escape(str(item.get("Parcel_ID","Parcel")))
         unit=escape(str(item.get("Parcel_Unit_ID","")))
-        boxes.append("<g><title>{} · {} · {} orientation · ({:.1f}, {:.1f}, {:.1f}) cm</title>"
+        stop=item.get("Delivery_Stop")
+        stop_label=" · Stop {}".format(int(stop)) if stop is not None else ""
+        boxes.append("<g><title>{} · {}{} · {} orientation · ({:.1f}, {:.1f}, {:.1f}) cm</title>"
             "<rect x='{:.1f}' y='{:.1f}' width='{:.1f}' height='{:.1f}' rx='3' fill='{}' fill-opacity='.88' stroke='white' stroke-width='2'/>"
             "<text x='{:.1f}' y='{:.1f}' text-anchor='middle' dominant-baseline='middle' fill='white' font-size='11' font-family='sans-serif'>{}</text></g>".format(
-                unit,label,escape(str(item.get("Orientation",""))),float(item["X_cm"]),float(item["Y_cm"]),float(item["Z_cm"]),
+                unit,label,escape(stop_label),escape(str(item.get("Orientation",""))),float(item["X_cm"]),float(item["Y_cm"]),float(item["Z_cm"]),
                 x,y,width,height,color,x+width/2,y+height/2,label[:18]))
     svg=("<svg viewBox='0 0 {} {}' role='img' aria-label='Top view of the selected vehicle cargo layer' "
         "style='width:100%;height:auto;background:#fbfcfb;border:1px solid #dfe8e2;border-radius:10px'>"
@@ -53,7 +55,7 @@ def render_loading_layer(placements,vehicle,key):
         "</svg>").format(svg_width,svg_height,margin_left,margin_top,canvas_width,canvas_height,"".join(boxes),
             margin_left+canvas_width/2,svg_height-10,interior_length,margin_top+canvas_height/2,margin_top+canvas_height/2,interior_width)
     st.markdown(svg,unsafe_allow_html=True)
-    st.caption("Top view of parcels starting at Z={} cm. Box color groups shipments; hover a box for its unit, orientation, and position.".format(selected))
+    st.caption("Top view of parcels starting at Z={} cm. X increases toward the rear door at the right; stop 1 should be nearest that door. Hover a box for its stop, orientation, and position.".format(selected))
 
 
 def render_loading_3d(placements,vehicle,key):
@@ -76,7 +78,8 @@ def render_loading_3d(placements,vehicle,key):
         for a,b,c in faces:
             ii.append(offset+a);jj.append(offset+b);kk.append(offset+c)
             facecolors.append(_color(item.get("Order_ID",item.get("Parcel_ID",""))))
-        tip="{} · {} · {} · {} · {} × {} × {} cm · position ({}, {}, {}) cm".format(
+        tip="Stop {} · {} · {} · {} · {} · {} × {} × {} cm · position ({}, {}, {}) cm".format(
+            item.get("Delivery_Stop","—"),
             escape(str(item.get("Parcel_Unit_ID",""))),escape(str(item.get("Order_ID",""))),
             escape(str(item.get("Parcel_ID",""))),escape(str(item.get("Orientation",""))),
             length,width,height,x,y,z)

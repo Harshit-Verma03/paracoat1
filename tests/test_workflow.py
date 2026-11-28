@@ -7,10 +7,11 @@ import unittest
 
 import pandas as pd
 
-from paracoat.dispatch import build_dispatch, reassign_order, change_parcel_orientation, move_stop
+from paracoat.dispatch import (build_dispatch, reassign_order, change_parcel_orientation,
+    move_parcel_position, move_stop, _two_opt_distance_order)
 from paracoat.packing import check_fit, orientation_options
 from paracoat.loading_optimizer import optimize_fleet_loading
-from paracoat.planner import optimize
+from paracoat.planner import optimize, _fallback_plan
 from paracoat.routing import build_matrix
 from paracoat.sample_data import (sample_depot, sample_fleet, sample_orders, sample_parcels,
                                   extended_demo_orders, extended_demo_parcels, extended_demo_fleet)
@@ -61,6 +62,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(result["unassigned"])
         self.assertGreaterEqual(result["vehicles_used"],2)
         self.assertEqual(len(result["placements"]),int(parcels.Quantity.sum()))
+
+    def test_unassigned_reason_explains_candidate_failure_without_claiming_impossibility(self):
+        orders=pd.DataFrame([{"Order_ID":"S1","Demand_kg":1,"_matrix_index":1}])
+        parcels=pd.DataFrame([{"Order_ID":"S1","Parcel_ID":"P1","Quantity":1,
+            "Length_cm":10,"Width_cm":10,"Height_cm":10,"Weight_kg":1,
+            "Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Any"}])
+        fleet=pd.DataFrame([{"Vehicle_ID":"V1","Available_Today":"Yes","Capacity_kg":10,
+            "Interior_Length_cm":20,"Interior_Width_cm":20,"Interior_Height_cm":20}])
+        def reject_candidate(assignments,remaining_seconds):
+            return {"feasible":False,"failed_groups":[("V1",["S1"],"Test route validation failure")],"routes":[]}
+        result=optimize_fleet_loading(orders,parcels,fleet,[[0,1],[1,0]],[[0,1],[1,0]],
+            time_limit_seconds=2,candidate_validator=reject_candidate)
+        self.assertEqual(len(result["unassigned"]),1)
+        reason=result["unassigned"][0]["Reason"]
+        self.assertIn("within the search budget",reason)
+        self.assertIn("Last candidate issue: Test route validation failure",reason)
 
     def test_shipment_can_be_edited_and_soft_cancelled(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -232,6 +249,30 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(int(parcels.Quantity.sum()), 9)
         self.assertTrue(check_fit(parcels, fleet.iloc[0])["fits"])
 
+    def test_geometric_fit_never_returns_partial_placements_as_a_feasible_load(self):
+        parcels=pd.DataFrame([
+            {"Order_ID":"O1","Parcel_ID":"SAME","Quantity":1,"Length_cm":10,"Width_cm":10,"Height_cm":10,"Weight_kg":1,"Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Upright only"},
+            {"Order_ID":"O2","Parcel_ID":"SAME","Quantity":1,"Length_cm":11,"Width_cm":10,"Height_cm":10,"Weight_kg":1,"Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Upright only"},
+        ])
+        vehicle=pd.Series({"Interior_Length_cm":10,"Interior_Width_cm":10,"Interior_Height_cm":10})
+        result=check_fit(parcels,vehicle)
+        self.assertFalse(result["fits"])
+        self.assertEqual(result["placement_rows"],[])
+        self.assertEqual(len(result["failed"]),2)
+        self.assertIn("bounded placement search",result["reason"])
+
+    def test_loading_order_places_earliest_delivery_nearest_rear_door(self):
+        parcels=pd.DataFrame([
+            {"Order_ID":"FIRST","Delivery_Stop":1,"Parcel_ID":"A","Quantity":1,"Length_cm":30,"Width_cm":40,"Height_cm":40,"Weight_kg":1,"Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Upright only"},
+            {"Order_ID":"SECOND","Delivery_Stop":2,"Parcel_ID":"B","Quantity":1,"Length_cm":30,"Width_cm":40,"Height_cm":40,"Weight_kg":1,"Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Upright only"},
+        ])
+        vehicle=pd.Series({"Interior_Length_cm":60,"Interior_Width_cm":40,"Interior_Height_cm":40})
+        result=check_fit(parcels,vehicle)
+        self.assertTrue(result["fits"],result["reason"])
+        by_stop={row["Delivery_Stop"]:row for row in result["placement_rows"]}
+        self.assertGreaterEqual(by_stop[1]["X_cm"],by_stop[2]["X_cm"]+by_stop[2]["Placed_Length_cm"])
+        self.assertEqual({row["Delivery_Stop"] for row in result["placement_rows"]},{1,2})
+
     def test_loading_optimizer_assigns_stable_parcel_units_with_orientations(self):
         orders,parcels,fleet,_,distances,durations=prepared()
         orders=orders.copy().reset_index(drop=True)
@@ -371,6 +412,70 @@ class WorkflowTests(unittest.TestCase):
         result=optimize_fleet_loading(orders,parcels,fleet,distances,durations,objective="Travel time",time_limit_seconds=3)
         self.assertEqual(list(result["assignments"]),["ECONOMICAL"])
 
+    def test_selected_travel_time_objective_outweighs_vehicle_cost(self):
+        order_ids=["A","B","C","D"]
+        orders=pd.DataFrame([{"Order_ID":value,"_matrix_index":index+1} for index,value in enumerate(order_ids)])
+        parcels=pd.DataFrame([{"Order_ID":value,"Parcel_ID":value,"Quantity":1,
+            "Length_cm":10,"Width_cm":10,"Height_cm":10,"Weight_kg":1,
+            "Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Any"} for value in order_ids])
+        fleet=pd.DataFrame([
+            {"Vehicle_ID":"ECONOMICAL","Available_Today":"Yes","Capacity_kg":2,
+             "Interior_Length_cm":100,"Interior_Width_cm":100,"Interior_Height_cm":100,"Cost_Per_Km":1},
+            {"Vehicle_ID":"COSTLY","Available_Today":"Yes","Capacity_kg":2,
+             "Interior_Length_cm":100,"Interior_Width_cm":100,"Interior_Height_cm":100,"Cost_Per_Km":100},
+        ])
+        distances=[[0,100,100,1,1],[100,0,200,100,100],[100,200,0,100,100],
+                   [1,100,100,0,1],[1,100,100,1,0]]
+        durations=[[0,10,10,10,10],[10,0,20,1,20],[10,20,0,20,1],
+                   [10,1,20,0,20],[10,20,1,20,0]]
+        result=optimize_fleet_loading(orders,parcels,fleet,distances,durations,
+            objective="Travel time",time_limit_seconds=3)
+        groups={frozenset(ids) for ids in result["assignments"].values()}
+        self.assertEqual(groups,{frozenset({"A","C"}),frozenset({"B","D"})})
+
+    def test_route_capacity_preserves_fractional_kilograms(self):
+        orders=pd.DataFrame([
+            {"Order_ID":"A","Customer_Name":"A","Address":"A","Latitude":1,"Longitude":1,"Demand_kg":0.7,"_matrix_index":1},
+            {"Order_ID":"B","Customer_Name":"B","Address":"B","Latitude":2,"Longitude":2,"Demand_kg":0.7,"_matrix_index":2},
+        ])
+        fleet=pd.DataFrame([{"Vehicle_ID":"V1","Available_Today":"Yes","Capacity_kg":1.4}])
+        matrix=[[0,1,2],[1,0,1],[2,1,0]]
+        result=optimize(orders,fleet,matrix,matrix,time_limit_seconds=1)
+        self.assertEqual({str(row["Order_ID"]) for row in result["routes"]},{"A","B"})
+        self.assertFalse(result["unassigned"])
+
+    def test_route_fallback_uses_travel_time_metric_when_requested(self):
+        orders=pd.DataFrame([
+            {"Order_ID":"A","Customer_Name":"A","Address":"A","Latitude":0,"Longitude":0,"Demand_kg":1,"_matrix_index":1},
+            {"Order_ID":"B","Customer_Name":"B","Address":"B","Latitude":0,"Longitude":0,"Demand_kg":1,"_matrix_index":2},
+        ])
+        fleet=pd.DataFrame([
+            {"Vehicle_ID":"V1","Available_Today":"Yes","Capacity_kg":1},
+            {"Vehicle_ID":"V2","Available_Today":"Yes","Capacity_kg":1},
+        ])
+        distances=[[0,10,10],[10,0,1],[10,1,0]]
+        durations=[[0,10,1],[10,0,100],[1,100,0]]
+        result=_fallback_plan(orders,fleet,distances,durations,objective="Travel time")
+        assignment={str(row["Order_ID"]):str(row["Vehicle_ID"]) for row in result["routes"]}
+        self.assertEqual(assignment["A"],"V1")
+        self.assertEqual(assignment["B"],"V2")
+
+    def test_two_opt_refines_nearest_neighbor_route_without_increasing_distance(self):
+        import math
+        import time
+        points=[(0,0),(-4,-10),(-11,20),(-19,-6),(-6,8),(-11,-3)]
+        matrix=[[math.hypot(a[0]-b[0],a[1]-b[1]) for b in points] for a in points]
+        order_ids=["A","B","C","D","E"]
+        order_by_id={order_id:pd.Series({"_matrix_index":index+1})
+                     for index,order_id in enumerate(order_ids)}
+        nearest=["D","E","C","A","B"]
+        def cost(sequence):
+            nodes=[0]+[int(order_by_id[value]._matrix_index) for value in sequence]+[0]
+            return sum(matrix[left][right] for left,right in zip(nodes,nodes[1:]))
+        refined=_two_opt_distance_order(nearest,order_by_id,matrix,time.monotonic()+1)
+        self.assertLess(cost(refined),cost(nearest))
+        self.assertEqual(sorted(refined),sorted(nearest))
+
     def test_rotation_rules_and_maximum_stack_weight(self):
         parcel=pd.DataFrame([{"Parcel_ID":"ROT-1","Order_ID":"R1","Quantity":1,"Length_cm":190,"Width_cm":40,"Height_cm":30,"Weight_kg":10,"Stackable":"Yes","Max_Stack_Weight_kg":50,"Rotation":"Any"}])
         vehicle=pd.Series({"Interior_Length_cm":100,"Interior_Width_cm":200,"Interior_Height_cm":100})
@@ -379,7 +484,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(check_fit(parcel,vehicle)["fits"])
         stacked=pd.DataFrame([
             {"Parcel_ID":"BASE","Order_ID":"S1","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":50,"Weight_kg":5,"Stackable":"Yes","Max_Stack_Weight_kg":5,"Rotation":"Upright only"},
-            {"Parcel_ID":"TOP","Order_ID":"S2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":30,"Weight_kg":10,"Stackable":"Yes","Max_Stack_Weight_kg":50,"Rotation":"Upright only"},
+            {"Parcel_ID":"TOP","Order_ID":"S2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":30,"Weight_kg":10,"Stackable":"No","Max_Stack_Weight_kg":50,"Rotation":"Upright only"},
         ])
         small_vehicle=pd.Series({"Interior_Length_cm":50,"Interior_Width_cm":50,"Interior_Height_cm":100})
         result=check_fit(stacked,small_vehicle)
@@ -388,40 +493,50 @@ class WorkflowTests(unittest.TestCase):
 
     def test_stacking_support_propagates_cumulative_load_and_reports_unknown_limit(self):
         stacked=pd.DataFrame([
-            {"Parcel_ID":"BASE","Order_ID":"S1","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":40,"Weight_kg":2,"Stackable":"Yes","Max_Stack_Weight_kg":9,"Rotation":"Upright only"},
-            {"Parcel_ID":"MIDDLE","Order_ID":"S2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":30,"Weight_kg":4,"Stackable":"Yes","Max_Stack_Weight_kg":20,"Rotation":"Upright only"},
-            {"Parcel_ID":"TOP","Order_ID":"S3","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":20,"Weight_kg":5,"Stackable":"Yes","Max_Stack_Weight_kg":0,"Rotation":"Upright only"},
+            {"Parcel_ID":"BASE","Order_ID":"S1","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":50,"Weight_kg":5,"Stackable":"Yes","Max_Stack_Weight_kg":8,"Rotation":"Upright only"},
+            {"Parcel_ID":"MIDDLE","Order_ID":"S2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":50,"Weight_kg":5,"Stackable":"Yes","Max_Stack_Weight_kg":8,"Rotation":"Upright only"},
+            {"Parcel_ID":"TOP","Order_ID":"S3","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":50,"Weight_kg":5,"Stackable":"Yes","Max_Stack_Weight_kg":8,"Rotation":"Upright only"},
         ])
-        vehicle=pd.Series({"Interior_Length_cm":50,"Interior_Width_cm":50,"Interior_Height_cm":90})
-        self.assertTrue(check_fit(stacked,vehicle)["fits"])
-        stacked.loc[stacked.Parcel_ID=="BASE","Max_Stack_Weight_kg"]=8
+        vehicle=pd.Series({"Interior_Length_cm":50,"Interior_Width_cm":50,"Interior_Height_cm":150})
         overloaded=check_fit(stacked,vehicle)
         self.assertFalse(overloaded["fits"])
-        self.assertIn("BASE",overloaded["exceeded_stack"])
-        stacked.loc[stacked.Parcel_ID=="BASE","Max_Stack_Weight_kg"]=0
-        unknown=check_fit(stacked,vehicle)
+        self.assertTrue(overloaded["exceeded_stack"])
+        unknown_parcels=pd.DataFrame([
+            {"Parcel_ID":"UNKNOWN-BASE","Order_ID":"U1","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":30,"Weight_kg":2,"Stackable":"Yes","Max_Stack_Weight_kg":0,"Rotation":"Upright only"},
+            {"Parcel_ID":"NO-STACK-TOP","Order_ID":"U2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":30,"Weight_kg":5,"Stackable":"No","Max_Stack_Weight_kg":0,"Rotation":"Upright only"},
+        ])
+        unknown=check_fit(unknown_parcels,pd.Series({"Interior_Length_cm":50,"Interior_Width_cm":50,"Interior_Height_cm":60}))
         self.assertFalse(unknown["fits"])
-        self.assertIn("BASE",unknown["unknown_stack_limits"])
+        self.assertIn("UNKNOWN-BASE",unknown["unknown_stack_limits"])
         self.assertIn("unknown",unknown["reason"].lower())
 
     def test_parcel_with_partial_base_support_is_rejected(self):
         parcels=pd.DataFrame([
             {"Parcel_ID":"BASE","Order_ID":"S1","Quantity":1,"Length_cm":40,"Width_cm":50,"Height_cm":50,"Weight_kg":2,"Stackable":"Yes","Max_Stack_Weight_kg":20,"Rotation":"Upright only"},
-            {"Parcel_ID":"OVERHANG","Order_ID":"S2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":40,"Weight_kg":2,"Stackable":"Yes","Max_Stack_Weight_kg":20,"Rotation":"Upright only"},
+            {"Parcel_ID":"OVERHANG","Order_ID":"S2","Quantity":1,"Length_cm":50,"Width_cm":50,"Height_cm":40,"Weight_kg":2,"Stackable":"No","Max_Stack_Weight_kg":20,"Rotation":"Upright only"},
         ])
         vehicle=pd.Series({"Interior_Length_cm":50,"Interior_Width_cm":50,"Interior_Height_cm":90})
         result=check_fit(parcels,vehicle)
         self.assertFalse(result["fits"])
-        self.assertIn("OVERHANG",result["unsupported_stack"])
+        self.assertIn("BASE",result["unsupported_stack"])
 
     def test_dispatch_assigns_each_order_once_within_capacity_and_fit(self):
         orders, parcels, fleet, _, distances, durations = prepared()
-        result = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=1)
+        result = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=8)
         assigned = [str(r["Order_ID"]) for r in result["routes"]]
         self.assertEqual(len(assigned), len(set(assigned)))
         self.assertEqual(set(assigned), set(orders.Order_ID.astype(str)))
         self.assertFalse(result["unassigned"])
+        self.assertTrue(result["complete"])
         self.assertEqual(len(result["placements"]),int(parcels.Quantity.sum()))
+        route_stops={(str(row["Order_ID"]),str(row["Vehicle_ID"])):int(row["Stop"]) for row in result["routes"]}
+        self.assertTrue(all(row["Delivery_Stop"]==route_stops[(str(row["Order_ID"]),str(row["Vehicle_ID"]))]
+                            for row in result["placements"]))
+        for vehicle_id in result["assignments"]:
+            load_rows=sorted((row for row in result["placements"] if row["Vehicle_ID"]==vehicle_id),
+                             key=lambda row:row["Load_Sequence"])
+            self.assertEqual([row["Delivery_Stop"] for row in load_rows],
+                             sorted((row["Delivery_Stop"] for row in load_rows),reverse=True))
         self.assertTrue(all(row["Vehicle_ID"] in result["assignments"] for row in result["placements"]))
         for vehicle_id, group in pd.DataFrame(result["routes"]).groupby("Vehicle_ID"):
             truck = fleet[fleet.Vehicle_ID.astype(str) == str(vehicle_id)].iloc[0]
@@ -429,9 +544,16 @@ class WorkflowTests(unittest.TestCase):
             ids = set(group.Order_ID.astype(str))
             self.assertTrue(check_fit(parcels[parcels.Order_ID.astype(str).isin(ids)], truck)["fits"])
 
+    def test_dispatch_with_unavailable_fleet_is_incomplete_and_cannot_be_called_feasible(self):
+        orders,parcels,fleet,_,distances,durations=prepared()
+        plan=build_dispatch(orders,parcels,fleet.iloc[0:0],distances,durations,time_limit_seconds=2)
+        self.assertFalse(plan["complete"])
+        self.assertTrue(plan["unassigned"])
+        self.assertTrue(plan["status"].startswith("Review required"))
+
     def test_reassignment_rejects_over_capacity_and_preserves_source(self):
         orders, parcels, fleet, _, distances, durations = prepared()
-        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=1)
+        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=8)
         assigned = str(plan["routes"][0]["Order_ID"])
         too_small = fleet[fleet.Vehicle_ID == "VAN-02"].copy()
         too_small.loc[:, "Capacity_kg"] = 1
@@ -443,10 +565,12 @@ class WorkflowTests(unittest.TestCase):
 
     def test_reassignment_recomputes_totals_and_keeps_one_copy(self):
         orders, parcels, fleet, _, distances, durations = prepared()
-        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=1)
+        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=8)
         order_id = str(plan["routes"][0]["Order_ID"])
-        target = "VAN-02" if str(plan["routes"][0]["Vehicle_ID"]) != "VAN-02" else "VAN-01"
-        updated = reassign_order(plan, order_id, target, orders, parcels, fleet, distances, durations)
+        target = "VAN-02"
+        revised_fleet=fleet.copy()
+        revised_fleet.loc[revised_fleet.Vehicle_ID==target,["Capacity_kg","Interior_Length_cm","Interior_Width_cm","Interior_Height_cm"]]=[900,600,300,250]
+        updated = reassign_order(plan, order_id, target, orders, parcels, revised_fleet, distances, durations)
         matches = [r for r in updated["routes"] if str(r["Order_ID"]) == order_id]
         self.assertEqual(len(matches), 1)
         self.assertEqual(str(matches[0]["Vehicle_ID"]), target)
@@ -456,7 +580,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_manual_parcel_orientation_repacks_vehicle_and_keeps_assignment(self):
         orders,parcels,fleet,_,distances,durations=prepared()
-        plan=build_dispatch(orders,parcels,fleet,distances,durations,time_limit_seconds=2)
+        plan=build_dispatch(orders,parcels,fleet,distances,durations,time_limit_seconds=8)
         placement=next(row for row in plan["placements"]
                        if len({dims for _,dims in orientation_options(parcels[
                            (parcels.Order_ID.astype(str)==row["Order_ID"])&
@@ -475,9 +599,37 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"not allowed"):
             change_parcel_orientation(plan,placement["Parcel_Unit_ID"],"X-Y-Z",parcels,fleet)
 
+    def test_manual_parcel_position_pins_unit_and_revalidates_vehicle(self):
+        parcels=pd.DataFrame([{"Order_ID":"O1","Parcel_ID":"P1","Quantity":1,"Length_cm":10,"Width_cm":10,"Height_cm":10,"Weight_kg":1,"Stackable":"Yes","Max_Stack_Weight_kg":10,"Rotation":"Any"}])
+        fleet=pd.DataFrame([{"Vehicle_ID":"V1","Available_Today":"Yes","Capacity_kg":100,"Interior_Length_cm":100,"Interior_Width_cm":100,"Interior_Height_cm":100}])
+        fit=check_fit(parcels,fleet.iloc[0])
+        placement=dict(fit["placement_rows"][0],Vehicle_ID="V1",Delivery_Stop=1)
+        routes=[{"Vehicle_ID":"V1","Order_ID":"O1","Stop":1}]
+        plan={"routes":routes,"placements":[placement],"unassigned":[],"fit_results":{"V1":{"fits":True}}}
+        original_routes=list(plan["routes"])
+        original_positions={placement["Parcel_Unit_ID"]:(placement["X_cm"],placement["Y_cm"],placement["Z_cm"])}
+        updated=move_parcel_position(plan,placement["Parcel_Unit_ID"],5,0,0,parcels,fleet)
+        moved=next(row for row in updated["placements"]
+                   if row["Parcel_Unit_ID"]==placement["Parcel_Unit_ID"])
+        self.assertEqual((moved["X_cm"],moved["Y_cm"],moved["Z_cm"]),(5,0,0))
+        self.assertEqual(updated["routes"],original_routes)
+        self.assertEqual(len(updated["placements"]),int(parcels.Quantity.sum()))
+        self.assertTrue(updated["fit_results"]["V1"]["fits"])
+        self.assertEqual(plan["placements"],[
+            dict(row,X_cm=original_positions[row["Parcel_Unit_ID"]][0],
+                 Y_cm=original_positions[row["Parcel_Unit_ID"]][1],
+                 Z_cm=original_positions[row["Parcel_Unit_ID"]][2]) for row in plan["placements"]])
+        with self.assertRaisesRegex(ValueError,"full vehicle-load validation"):
+            move_parcel_position(plan,placement["Parcel_Unit_ID"],9999,0,0,parcels,fleet)
+        with self.assertRaisesRegex(ValueError,"non-negative"):
+            move_parcel_position(plan,placement["Parcel_Unit_ID"],-1,0,0,parcels,fleet)
+        approved=dict(plan,approver="Dispatcher")
+        with self.assertRaisesRegex(ValueError,"locked"):
+            move_parcel_position(approved,placement["Parcel_Unit_ID"],5,0,0,parcels,fleet)
+
     def test_approved_plan_rejects_parcel_orientation_edits(self):
         orders,parcels,fleet,_,distances,durations=prepared()
-        plan=build_dispatch(orders,parcels,fleet,distances,durations,time_limit_seconds=2)
+        plan=build_dispatch(orders,parcels,fleet,distances,durations,time_limit_seconds=8)
         plan["approver"]="Dispatcher"
         placement=plan["placements"][0]
         with self.assertRaisesRegex(ValueError,"locked"):
@@ -485,22 +637,28 @@ class WorkflowTests(unittest.TestCase):
 
     def test_unassigned_order_can_be_assigned_manually(self):
         orders, parcels, fleet, _, distances, durations = prepared()
-        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=1)
+        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=8)
         order_id = str(plan["routes"][0]["Order_ID"])
         draft = dict(plan)
         draft["routes"] = [r for r in plan["routes"] if str(r["Order_ID"]) != order_id]
         draft["unassigned"] = list(plan["unassigned"])+[{"Order_ID":order_id,"Reason":"Test hold"}]
-        updated = reassign_order(draft, order_id, "VAN-02", orders, parcels, fleet, distances, durations)
+        revised_fleet=fleet.copy()
+        revised_fleet.loc[revised_fleet.Vehicle_ID=="VAN-02",["Capacity_kg","Interior_Length_cm","Interior_Width_cm","Interior_Height_cm"]]=[900,600,300,250]
+        updated = reassign_order(draft, order_id, "VAN-02", orders, parcels, revised_fleet, distances, durations)
         self.assertNotIn(order_id, [str(r["Order_ID"]) for r in updated["unassigned"]])
         self.assertIn(order_id, [str(r["Order_ID"]) for r in updated["routes"]])
 
     def test_move_stop_recomputes_estimates(self):
         orders, parcels, fleet, _, distances, durations = prepared()
-        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=1)
+        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=8)
         group = sorted(plan["routes"], key=lambda r: int(r["Stop"]))
-        moved = move_stop(plan, str(group[-1]["Order_ID"]), "up", orders, distances, durations)
+        moved = move_stop(plan, str(group[-1]["Order_ID"]), "up", orders, distances, durations,
+                          parcels=parcels,fleet=fleet)
         self.assertEqual(len(moved["routes"]), len(plan["routes"]))
         self.assertGreater(moved["total_km"], 0)
+        ranks={(str(row["Order_ID"]),str(row["Vehicle_ID"])):int(row["Stop"]) for row in moved["routes"]}
+        self.assertTrue(all(row["Delivery_Stop"]==ranks[(str(row["Order_ID"]),str(row["Vehicle_ID"]))]
+                            for row in moved["placements"]))
 
     def test_stop_move_rejects_delivery_window_violation(self):
         orders=pd.DataFrame([
@@ -535,6 +693,51 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(any("whole number" in error for error in errors))
         self.assertTrue(any("decimal degrees" in error for error in errors))
 
+    def test_validation_allows_same_parcel_sku_across_orders(self):
+        orders,parcels,fleet,depot=sample_orders(),sample_parcels(),sample_fleet(),sample_depot()
+        parcels.loc[1,"Parcel_ID"]=parcels.loc[0,"Parcel_ID"]
+        *_,errors,_=validate_inputs(orders,parcels,fleet,depot)
+        self.assertFalse(any("duplicate Parcel_ID" in error for error in errors),errors)
+
+    def test_validation_rejects_duplicate_parcel_line_within_same_order(self):
+        orders,parcels,fleet,depot=sample_orders(),sample_parcels(),sample_fleet(),sample_depot()
+        parcels.loc[1,"Order_ID"]=parcels.loc[0,"Order_ID"]
+        parcels.loc[1,"Parcel_ID"]=parcels.loc[0,"Parcel_ID"]
+        *_,errors,_=validate_inputs(orders,parcels,fleet,depot)
+        self.assertTrue(any("duplicate Parcel_ID within Order_ID" in error for error in errors),errors)
+
+    def test_validation_rejects_nonfinite_optimizer_inputs_and_invalid_optional_fleet_limits(self):
+        orders,parcels,fleet,depot=sample_orders(),sample_parcels(),sample_fleet(),sample_depot()
+        parcels["Weight_kg"]=parcels.Weight_kg.astype(float)
+        fleet["Capacity_kg"]=fleet.Capacity_kg.astype(float)
+        parcels.loc[0,"Weight_kg"]=float("inf")
+        fleet.loc[0,"Capacity_kg"]=float("inf")
+        fleet.loc[0,"Door_Width_cm"]=999
+        fleet.loc[0,"Volume_m3"]=999
+        *_,errors,_=validate_inputs(orders,parcels,fleet,depot)
+        self.assertTrue(any("Weight_kg must contain finite positive" in error for error in errors))
+        self.assertTrue(any("Capacity_kg must contain finite positive" in error for error in errors))
+        self.assertTrue(any("door clear dimensions" in error.lower() for error in errors),errors)
+        self.assertTrue(any("usable volume cannot exceed" in error for error in errors),errors)
+
+    def test_validation_rejects_malformed_optional_route_and_stack_inputs(self):
+        orders,parcels,fleet,depot=sample_orders(),sample_parcels(),sample_fleet(),sample_depot()
+        orders["Service_Minutes"]=0
+        orders["Service_Minutes"]=orders.Service_Minutes.astype(object)
+        orders.loc[0,"Service_Minutes"]="fast"
+        parcels["Max_Stack_Weight_kg"]=0
+        parcels["Max_Stack_Weight_kg"]=parcels.Max_Stack_Weight_kg.astype(object)
+        parcels.loc[0,"Max_Stack_Weight_kg"]="unknown"
+        orders["Latitude"]=orders.Latitude.astype(object)
+        orders.loc[0,"Latitude"]=float("nan")
+        orders.loc[0,"Longitude"]=float("nan")
+        orders.loc[0,"Address"]="1 Example Road"
+        orders.loc[0,"Latitude"]="north"
+        *_,errors,_=validate_inputs(orders,parcels,fleet,depot)
+        self.assertTrue(any("Service_Minutes must be numeric" in error for error in errors))
+        self.assertTrue(any("Max_Stack_Weight_kg must be numeric" in error for error in errors))
+        self.assertTrue(any("Latitude must contain valid decimal-degree" in error for error in errors))
+
     def test_template_workbook_round_trip(self):
         payload=workbook_template()
         book = pd.ExcelFile(io.BytesIO(payload))
@@ -543,7 +746,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_dispatch_export_round_trip(self):
         orders, parcels, fleet, _, distances, durations = prepared()
-        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=1)
+        plan = build_dispatch(orders, parcels, fleet, distances, durations,time_limit_seconds=8)
         payload = export_plan(plan, parcels, fleet, "TEST-001", "2026-11-26")
         book = pd.ExcelFile(io.BytesIO(payload))
         self.assertEqual(book.sheet_names, ["Plan Summary", "Vehicle Summary", "Vehicle Routes", "Exceptions", "Parcel Inputs"])
